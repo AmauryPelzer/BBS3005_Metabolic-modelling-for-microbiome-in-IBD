@@ -23,6 +23,10 @@ if(!"bioDist" %in% installed.packages()) BiocManager::install("bioDist")
 if(!"biomaRt" %in% installed.packages()) BiocManager::install("biomaRt")
 if(!"dplyr" %in% installed.packages()) BiocManager::install("dplyr")
 if(!"magrittr" %in% installed.packages()) BiocManager::install("magrittr")
+if(!"EnhancedVolcano" %in% installed.packages()) BiocManager::install("EnhancedVolcano")
+if(!"clusterProfiler" %in% installed.packages()) BiocManager::install("clusterProfiler")
+if(!"KEGGREST" %in% installed.packages()) BiocManager::install("KEGGREST")
+if(!"org.EcK12.eg.db" %in% installed.packages()) BiocManager::install("org.EcK12.eg.db")
 
 #load packages
 library(rstudioapi)
@@ -39,6 +43,9 @@ library(magrittr)
 library(EnhancedVolcano)
 library(org.Hs.eg.db)
 library(VennDiagram)
+library(clusterProfiler)
+library(KEGGREST)
+library(org.EcK12.eg.db)
 
 # set your working environment to the location where your current source file is saved into.
 setwd(dirname(rstudioapi::getSourceEditorContext()$path))
@@ -46,6 +53,11 @@ setwd(dirname(rstudioapi::getSourceEditorContext()$path))
 source("functions_ArrayAnalysis_v2.R")
 WORK.DIR <- getwd()
 ```
+
+```{r}
+library(stringr)
+```
+
 
 ## Data Preparations
 The following section will prepar input data to be used in the analysis
@@ -89,10 +101,11 @@ mgxCount %<>% .[nonzero,]
 #############################CPM FILTERING#############################################
 #aveLogCPM function compute average log2 counts-per-million for each row of counts.
 #the below function is similar to log2(rowMeans(cpm(y, ...)))
-mean_log_cpm = aveLogCPM(mgxCount)
+#mean_log_cpm = aveLogCPM(mgxCount)
+mean_log_cpm = log2(rowMeans(cpm(mgxCount)))
 
 # We plot the distribution of average log2 CPM values to verify that our chosen presence threshold is appropriate. The distribution is expected to be bimodal, with a low-abundance peak representing non-expressed genes and a high-abundance peak representing expressed genes. The chosen threshold should separate the two peaks of the bimodal distribution. 
-filter_threshold <- 0.5# we can try different threshold values
+filter_threshold <- 0.75# we can try different threshold values
 #jpeg(file="avgLogCpmDist.jpeg")#if you want to save the histogram uncomment the following command  
 ggplot() + aes(x=mean_log_cpm) +
     geom_histogram(binwidth=0.2) +
@@ -105,11 +118,107 @@ mgxCount <- mgxCount[keep_genes,]
 #dim(mgxCount)#to check dimension of the data
 ###############################################################################
 ```
+## T-tests
+```{r}
+# Separate CD, UC and nonIBD
+cd <- sampleLabels[sampleLabels$disease=="CD",]
+uc <- sampleLabels[sampleLabels$disease=="UC",]
+nonIBD <- sampleLabels[sampleLabels$disease=="nonIBD",]
+
+# select metagenomics data from CD, UC and nonIBD
+metagenomics_cd <- subset(mgxCount, select= rownames(cd))
+metagenomics_uc <- subset(mgxCount, select= rownames(uc))
+metagenomics_nonIBD <- subset(mgxCount, select= rownames(nonIBD))
+```
+
+```{r}
+# Compute statistical significance (using t-test)
+pvalue_cd = NULL # Empty list for the p-values
+tstat_cd = NULL # Empty list of the t test statistics
+
+for(i in 1 : nrow(metagenomics_nonIBD)) { # For each gene : 
+	x = metagenomics_nonIBD[i,] # control of gene number i
+	y = metagenomics_cd[i,] # CD of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pvalue_cd[i] = t$p.value
+	# Put the current t-statistic in the tstats list
+	tstat_cd[i] = t$statistic
+}
+```
+
+
+```{r}
+# Compute statistical significance (using t-test)
+pvalue_uc = NULL # Empty list for the p-values
+tstat_uc = NULL # Empty list of the t test statistics
+
+for(i in 1 : nrow(metagenomics_nonIBD)) { # For each gene : 
+	x = metagenomics_nonIBD[i,] # control of gene number i
+	y = metagenomics_uc[i,] # CD of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pvalue_uc[i] = t$p.value
+	# Put the current t-statistic in the tstats list
+	tstat_uc[i] = t$statistic
+}
+```
+
+## KEGG pathway over-representation analysis
+Codes for KEGG organisms can be found here (https://www.genome.jp/kegg/catalog/org_list.html)
+```{r}
+deg.CD <- metagenomics_cd[which(pvalue_cd<0.05),]
+deg.UC <- metagenomics_uc[which(pvalue_uc<0.05),]
+```
+
+```{r}
+# Subset Bacteroides xylanisolvens
+deg.CD.xyl <- deg.CD[grepl("xylanisolvens", rownames(deg.CD), fixed = TRUE),]
+deg.UC.xyl <- deg.UC[grepl("xylanisolvens", rownames(deg.UC), fixed = TRUE),]
+```
+
+```{r}
+deg.CD.xyl$Gene.Family <- rownames(deg.CD.xyl)
+deg.UC.xyl$Gene.Family <- rownames(deg.UC.xyl)
+```
+
+```{r}
+# Split
+deg.CD.xyl[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.CD.xyl$Gene.Family, ': ', 2)
+deg.UC.xyl[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.UC.xyl$Gene.Family, ': ', 2)
+```
+
+
+```{r}
+# Convert EC numbers to Entrez IDs
+gene <- clusterProfiler::bitr(deg.CD.xyl$Gene.Family, fromType = "ENZYME", toType = "ENTREZID", OrgDb = org.EcK12.eg.db)
+
+# Convert Entrez IDs to KEGG IDs
+geneList <- sub("^", "ncbi-geneid:", gene[,2])
+geneList <- keggConv("eco", geneList)
+```
+
+```{r}
+# Remove preceding 'eco:'
+#geneList <- gsub("eco:", "", geneList)
+
+kk <- enrichKEGG(gene         = geneList,
+                 organism     = 'eco',
+                 pvalueCutoff = 0.05)
+head(kk)
+```
+
 
 ## Differential Gene Expression Analysis
 In the following section differential gene expression analysis will be performed using DESeq2 package
 ```{r deg analysis,warning=FALSE, message=FALSE}
-#we wil firstly create a DESeqDataSet object
+#we will firstly create a DESeqDataSet object
 #(non-intercept) statistical model based on the disease and biopsy_location, group column represent both of them 
 dds <- DESeqDataSetFromMatrix(countData = mgxCount, colData=sampleLabels, design= ~0 + group)
 
