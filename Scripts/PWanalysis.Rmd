@@ -1,0 +1,397 @@
+---
+title: "Pathway analysis"
+author: "AmauryPelzer"
+date: "19/06/22"
+output:
+ md_document:
+    variant: markdown_github
+always_allow_html: true
+---
+
+## Introduction
+
+In this workflow, pathway analysis will be performed on host-metagenomics data.
+
+## R environment setup
+
+First, we need to make sure all required packages are installed
+
+```{r setup, warning=FALSE, message=FALSE}
+# Check if libraries are already installed > otherwise install it
+if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager",repos = "http://cran.us.r-project.org")
+if(!"rstudioapi" %in% installed.packages()) BiocManager::install("rstudioapi")
+if(!"clusterProfiler" %in% installed.packages()) BiocManager::install("clusterProfiler")
+if(!"KEGGREST" %in% installed.packages()) BiocManager::install("KEGGREST")
+if(!"org.EcK12.eg.db" %in% installed.packages()) BiocManager::install("org.EcK12.eg.db")
+
+# Load packages
+library(rstudioapi)
+library(clusterProfiler)
+library(KEGGREST)
+library(org.EcK12.eg.db)
+library(stringr)
+
+# Set your working environment to the location where your current source file is saved into.
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+# Include some functions adapted from ArrayAnalysis.org scripts
+WORK.DIR <- getwd()
+```
+
+## Data Preparations
+
+The following section will prepare input data to be used in the analysis
+
+```{r read data,warning=FALSE, message=FALSE}
+# Read  the metagenomics data file
+mgxCount <- read.table(file = '../Data/ecs_relab_2', sep = '\t', header = TRUE)
+
+# Read metadata file sample labels
+sampleLabels <- read.table(file = "../Data/metadata", row.names=1,sep = '\t', stringsAsFactors = TRUE)
+
+# Select the samples IDs
+mgxCount <- subset(mgxCount, select=rownames(sampleLabels))
+
+# Add column names to the metadata file
+colnames(sampleLabels) <- c( "sampleID", "biopsy_location", "disease")
+# Check whether sample names are in same order
+all(colnames(mgxCount) == rownames(sampleLabels))
+
+sampleLabels$disease <- relevel(sampleLabels$disease,ref="nonIBD")
+# Add an experimental group variable to sampleLabels
+sampleLabels$group <- as.factor(sampleLabels$disease)
+```
+
+## Filtering Steps
+
+We will apply some filtering process to filter out genes in the input data
+
+```{r filtering,warning=FALSE, message=FALSE}
+# Remove genes which has all zero values for all samples then start DE analysis
+mgxCount[is.na(mgxCount)] <- 0
+nonzero <- rowSums(mgxCount) > 0
+mgxCount %<>% .[nonzero,]
+
+# Compute average log2 counts-per-million for each row of counts.
+mean_log_cpm = log2(rowMeans(cpm(mgxCount)))
+
+# We plot the distribution of average log2 CPM values to verify that our chosen presence threshold is appropriate. The distribution is expected to be bimodal, with a low-abundance peak representing non-expressed genes and a high-abundance peak representing expressed genes. The chosen threshold should separate the two peaks of the bimodal distribution. 
+filter_threshold <- 0.75# we can try different threshold values
+#jpeg(file="avgLogCpmDist.jpeg")#if you want to save the histogram uncomment the following command  
+ggplot() + aes(x=mean_log_cpm) +
+    geom_histogram(binwidth=0.2) +
+    geom_vline(xintercept=filter_threshold) +
+    ggtitle("Histogram of mean expression values")
+#dev.off()#to save the plot to the file
+
+# Having chosen our threshold, lets pick the subset of genes whose average expression passes that threshold.
+keep_genes <- mean_log_cpm >= filter_threshold 
+mgxCount <- mgxCount[keep_genes,]
+#dim(mgxCount)#to check dimension of the data
+```
+
+## T-tests
+
+```{r}
+# Separate CD, UC and nonIBD
+cd <- sampleLabels[sampleLabels$disease=="CD",]
+uc <- sampleLabels[sampleLabels$disease=="UC",]
+nonIBD <- sampleLabels[sampleLabels$disease=="nonIBD",]
+
+# Select metagenomics data from CD, UC and nonIBD
+metagenomics_cd <- subset(mgxCount, select= rownames(cd))
+metagenomics_uc <- subset(mgxCount, select= rownames(uc))
+metagenomics_nonIBD <- subset(mgxCount, select= rownames(nonIBD))
+```
+
+```{r}
+# Compute statistical significance (using t-test)
+pvalue_cd = NULL # Empty list for the p-values
+padjust_cd = NULL # Empty list for the adjusted p-values
+tstat_cd = NULL # Empty list of the t test statistics
+regulation_cd = NULL # Empty list for the factor: up-regulated and down-regulated
+
+for(i in 1 : nrow(metagenomics_nonIBD)) { # For each gene : 
+	x = metagenomics_nonIBD[i,] # control of gene number i
+	y = metagenomics_cd[i,] # CD of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pvalue_cd[i] = t$p.value
+	# Put the current t-statistic in the tstats list
+	tstat_cd[i] = t$statistic
+	
+	# Put the status (up or down-regulated) in regulation list
+	if (rowMeans(x)<rowMeans(y))
+	{
+	  regulation_cd[i] = "Up-regulated"
+	}
+	else
+	{
+	  regulation_cd[i] = "Down-regulated"
+	}
+}
+
+#padjust_cd = p.adjust(pvalue_cd, method="BH", n= nrow(metagenomics_nonIBD))
+```
+
+```{r}
+# Compute statistical significance (using t-test)
+pvalue_uc = NULL # Empty list for the p-values
+padjust_uc = NULL # Empty list for the adjusted p-values
+tstat_uc = NULL # Empty list of the t test statistics
+regulation_uc = NULL # Empty list for the factor: up-regulated and down-regulated
+
+for(i in 1 : nrow(metagenomics_nonIBD)) { # For each gene : 
+	x = metagenomics_nonIBD[i,] # control of gene number i
+	y = metagenomics_uc[i,] # UC of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pvalue_uc[i] = t$p.value
+	# Put the current t-statistic in the tstats list
+	tstat_uc[i] = t$statistic
+	
+	# Put the status (up or down-regulated) in regulation list
+	if (rowMeans(x)<rowMeans(y))
+	{
+	  regulation_uc[i] = "Up-regulated"
+	}
+	else
+	{
+	  regulation_uc[i] = "Down-regulated"
+	}
+}
+
+#padjust_uc = p.adjust(pvalue_uc, method="BH", n= nrow(metagenomics_nonIBD))
+
+```
+
+```{r}
+# Select statistically significant enzymes
+deg.CD <- metagenomics_cd[which(pvalue_cd<0.05),]
+regulation.deg.CD <- regulation_cd[which(pvalue_cd<0.05)]
+deg.UC <- metagenomics_uc[which(pvalue_uc<0.05),]
+regulation.deg.UC <- regulation_uc[which(pvalue_uc<0.05)]
+```
+
+## KEGG pathway over-representation analysis
+
+Codes for KEGG organisms can be found here (<https://www.genome.jp/kegg/catalog/org_list.html>)
+
+```{r}
+# Subset Bacteroides xylanisolvens
+deg.CD.xyl <- deg.CD[grepl("xylanisolvens", rownames(deg.CD), fixed = TRUE),]
+deg.UC.xyl <- deg.UC[grepl("xylanisolvens", rownames(deg.UC), fixed = TRUE),]
+
+# Add row names as a column
+deg.CD.xyl$Gene.Family <- rownames(deg.CD.xyl)
+deg.UC.xyl$Gene.Family <- rownames(deg.UC.xyl)
+
+# Split Gene.Family and Name.Organism
+deg.CD.xyl[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.CD.xyl$Gene.Family, ': ', 2)
+deg.UC.xyl[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.UC.xyl$Gene.Family, ': ', 2)
+```
+
+```{r}
+# Add row names as column
+deg.CD$Gene.Family <- rownames(deg.CD)
+deg.UC$Gene.Family <- rownames(deg.UC)
+
+# Separate Gene.Family from the Name and Organism
+deg.CD[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.CD$Gene.Family, ': ', 2)
+deg.UC[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.UC$Gene.Family, ': ', 2)
+
+deg.CD[c('Name', 'Organism')] <- str_split_fixed(deg.CD$Name.Organism, '.s__', 2)
+deg.UC[c('Name', 'Organism')] <- str_split_fixed(deg.UC$Name.Organism, '.s__', 2)
+
+# Add regulation in main variable
+deg.CD$regulation <- regulation.deg.CD
+deg.UC$regulation <- regulation.deg.UC
+
+# Clean char variables
+deg.CD$Name <- sub("\\|.*", "", deg.CD$Name)
+deg.UC$Name <- sub("\\|.*", "", deg.UC$Name)
+
+deg.CD$Organism <- sub(" .*", "", deg.CD$Organism)
+deg.UC$Organism <- sub(" .*", "", deg.UC$Organism)
+
+deg.CD$Organism <- sub("\t.*", "", deg.CD$Organism)
+deg.UC$Organism <- sub("\t.*", "", deg.UC$Organism)
+```
+
+```{r}
+sort(table(as.factor(deg.UC$Organism)),decreasing = TRUE)
+```
+
+```{r}
+sort(table(as.factor(deg.CD$Organism)),decreasing = TRUE)
+```
+
+```{r}
+sort(table(as.factor(deg.UC$Name)),decreasing = TRUE)
+```
+
+### PW analysis for CD
+
+```{r}
+# Convert EC numbers to Entrez IDs
+gene.CD.xyl <- clusterProfiler::bitr(deg.CD.xyl$Gene.Family, fromType = "ENZYME", toType = "ENTREZID", OrgDb = org.EcK12.eg.db)
+
+# Convert Entrez IDs to KEGG IDs
+geneList.CD.xyl <- sub("^", "ncbi-geneid:", gene.CD.xyl[,2])
+geneList.CD.xyl <- keggConv("eco", geneList.CD.xyl)
+
+# Remove preceding 'eco:'
+geneList.CD.xyl <- gsub("eco:", "", geneList.CD.xyl)
+
+kk.CD.xyl <- enrichKEGG(gene         = geneList.CD.xyl,
+                 organism     = 'eco',
+                 pvalueCutoff = 0.05)
+head(kk.CD.xyl)
+```
+
+### PW analysis for UC
+
+```{r}
+# Convert EC numbers to Entrez IDs
+gene.UC.xyl <- clusterProfiler::bitr(deg.UC.xyl$Gene.Family, fromType = "ENZYME", toType = "ENTREZID", OrgDb = org.EcK12.eg.db)
+
+# Convert Entrez IDs to KEGG IDs
+geneList.UC.xyl <- sub("^", "ncbi-geneid:", gene.UC.xyl[,2])
+geneList.UC.xyl <- keggConv("eco", geneList.UC.xyl)
+
+# Remove preceding 'eco:'
+geneList.UC.xyl <- gsub("eco:", "", geneList.UC.xyl)
+
+kk.UC.xyl <- enrichKEGG(gene         = geneList.UC.xyl,
+                 organism     = 'eco',
+                 pvalueCutoff = 0.05)
+head(kk.UC.xyl)
+```
+
+## BioCyc pathway over-representation analysis
+
+```{r}
+# Read  the pathway abundance data file
+mgxPW <- read.table(file = '../Data/Mgx_pathabundance', sep = '\t', header = TRUE)
+
+# Select the samples IDs
+mgxPW <- subset(mgxPW, select=rownames(sampleLabels))
+
+# Remove genes which has all zero values for all samples then start DE analysis
+mgxPW[is.na(mgxPW)] <- 0
+nonzero <- rowSums(mgxPW) > 0
+mgxPW %<>% .[nonzero,]
+
+# Select metagenomics data from CD, UC and nonIBD
+pathway_cd <- subset(mgxPW, select= rownames(cd))
+pathway_uc <- subset(mgxPW, select= rownames(uc))
+pathway_nonIBD <- subset(mgxPW, select= rownames(nonIBD))
+```
+
+```{r}
+# Compute statistical significance (using t-test)
+pvalue_PW_cd = NULL # Empty list for the p-values
+padjust_PW_cd = NULL # Empty list for the adjusted p-values
+tstat_PW_cd = NULL # Empty list of the t test statistics
+regulation_PW_cd = NULL # Empty list for the factor: up-regulated and down-regulated
+
+for(i in 1 : nrow(pathway_nonIBD)) { # For each gene : 
+	x = pathway_nonIBD[i,] # control of gene number i
+	y = pathway_cd[i,] # CD of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pvalue_PW_cd[i] = t$p.value
+	# Put the current t-statistic in the tstats list
+	tstat_PW_cd[i] = t$statistic
+	
+	# Put the status (up or down-regulated) in regulation list
+	if (rowMeans(x)<rowMeans(y))
+	{
+	  regulation_PW_cd[i] = "Up-regulated"
+	}
+	else
+	{
+	  regulation_PW_cd[i] = "Down-regulated"
+	}
+}
+
+#padjust_PW_cd = p.adjust(pvalue_PW_cd, method="BH", n= nrow(pathway_nonIBD))
+```
+
+```{r}
+# Compute statistical significance (using t-test)
+pvalue_PW_uc = NULL # Empty list for the p-values
+padjust_PW_uc = NULL # Empty list for the adjusted p-values
+tstat_PW_uc = NULL # Empty list of the t test statistics
+regulation_PW_uc = NULL # Empty list for the factor: up-regulated and down-regulated
+
+for(i in 1 : nrow(pathway_nonIBD)) { # For each gene : 
+	x = pathway_nonIBD[i,] # control of gene number i
+	y = pathway_uc[i,] # CD of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pvalue_PW_uc[i] = t$p.value
+	# Put the current t-statistic in the tstats list
+	tstat_PW_uc[i] = t$statistic
+	
+	# Put the status (up or down-regulated) in regulation list
+	if (rowMeans(x)<rowMeans(y))
+	{
+	  regulation_PW_uc[i] = "Up-regulated"
+	}
+	else
+	{
+	  regulation_PW_uc[i] = "Down-regulated"
+	}
+}
+
+#padjust_PW_uc = p.adjust(pvalue_PW_uc, method="BH", n= nrow(pathway_nonIBD))
+```
+
+
+```{r}
+# Select statistically significant enzymes
+deg.PW.CD <- pathway_cd[which(pvalue_PW_cd<0.05),]
+regulation.deg.PW.CD <- regulation_PW_cd[which(pvalue_PW_cd<0.05)]
+deg.PW.UC <- pathway_uc[which(pvalue_PW_uc<0.05),]
+regulation.deg.PW.UC <- regulation_PW_uc[which(pvalue_PW_uc<0.05)]
+```
+
+```{r}
+# Add row names as column
+deg.PW.CD$Gene.Family <- rownames(deg.PW.CD)
+deg.PW.UC$Gene.Family <- rownames(deg.PW.UC)
+
+# Separate Gene.Family from the Name and Organism
+deg.PW.CD[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.PW.CD$Gene.Family, ': ', 2)
+deg.PW.UC[c('Gene.Family', 'Name.Organism')] <- str_split_fixed(deg.PW.UC$Gene.Family, ': ', 2)
+
+deg.PW.CD[c('Name', 'Organism')] <- str_split_fixed(deg.PW.CD$Name.Organism, '.s__', 2)
+deg.PW.UC[c('Name', 'Organism')] <- str_split_fixed(deg.PW.UC$Name.Organism, '.s__', 2)
+
+# Add regulation in main variable
+deg.PW.CD$regulation <- regulation.deg.PW.CD
+deg.PW.UC$regulation <- regulation.deg.PW.UC
+
+# Clean char variables
+deg.PW.CD$Name <- sub("\\|.*", "", deg.PW.CD$Name)
+deg.PW.UC$Name <- sub("\\|.*", "", deg.PW.UC$Name)
+
+deg.PW.CD$Organism <- sub(" .*", "", deg.PW.CD$Organism)
+deg.PW.UC$Organism <- sub(" .*", "", deg.PW.UC$Organism)
+
+deg.PW.CD$Organism <- sub("\t.*", "", deg.PW.CD$Organism)
+deg.PW.UC$Organism <- sub("\t.*", "", deg.PW.UC$Organism)
+```
+
